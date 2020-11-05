@@ -1,0 +1,142 @@
+---
+title: "Geoconnex Demo"
+author: "dblodgett@usgs.gov"
+date: "11/4/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(jsonlite)
+library(dplyr, quietly = TRUE)
+```
+
+What's available from info.geoconnex.us?
+```{r}
+collection_url <- "https://info.geoconnex.us/collections"
+collections <- jsonlite::fromJSON(collection_url)
+
+knitr::kable(select(collections$collections, title, description))
+```
+
+Let's use New Mexico as our area of interest.
+
+```{r}
+nm_url <- "https://info.geoconnex.us/collections/states/items?STUSPS=NM"
+nm <- sf::read_sf(nm_url)
+mapview::mapview(list(`New Mexico` = nm))
+```
+
+The search above gave us one state that we can retrieve by it's ID. Below, we grab its JSON-LD format. Below, we print two text of what can be interpreted 
+
+```{r}
+accept_jsonld <- httr::add_headers("Accept" = "application/ld+json")
+
+nm_ld <- rawToChar(httr::GET(nm$id, config = accept_jsonld)$content)
+
+prettify(nm_ld)
+
+nm_ld <- jsonld::jsonld_flatten(nm_ld)
+
+nm_ld
+
+nm_ld <- fromJSON(nm_ld)
+```
+
+This gives us some basic information. The `@id` here is especially useful. Note that the `@id` (the subject of all the triples in the document) is the same as the `id` of the State GeoJSON we mapped above and used to retrieve this JSON-LD document. 
+
+Notice that we can get a name using a linked data property `https://schema.org/name` here. This is an example of structured data that would allow automated creation of information products that is an aim of geoconnex.us.
+
+```{r}
+
+nm_feature <- sf::read_sf(nm_ld$`@id`)
+
+nm_feature_name <- nm_ld$`https://schema.org/name`[[1]]$`@value`
+
+# Could make html links clickable in mapview
+
+nm_map_layer <- setNames(list(nm_feature), nm_feature_name)
+
+mapview::mapview(nm_map_layer)
+
+```
+
+Now let's pivot to look at some data that's available for NM. For this example, let's first find all the HUC08s in NM. For this example, we'll use a spatial intersection, but as geoconnex grows, these kinds of queries will be possible directly in the linked data.
+
+```{r}
+
+hu08_url <- paste0("https://info.geoconnex.us/collections/hu08/items?bbox=",
+                   paste(sf::st_bbox(nm_feature), collapse = ","))
+
+hu08 <- sf::read_sf(hu08_url)
+
+mapview::mapview(list("HUC8" = hu08))
+
+```
+Now let's zoom in and look at the Pecos Headwaters HU08.
+
+```{r}
+
+hu08 <- filter(hu08, grepl("Pecos Headwaters", NAME))
+
+mapview::mapview(setNames(list(hu08), hu08$NAME))
+
+```
+
+First, let's look at what community reference stream gages are in this HU08
+
+```{r}
+
+stream_gages_url <- paste0("https://info.geoconnex.us/collections/gages/items?bbox=",
+                           paste(sf::st_bbox(hu08), collapse = ","))
+
+stream_gages <- sf::st_intersection(sf::read_sf(stream_gages_url),
+                                    hu08)
+
+mapview::mapview(stream_gages)
+
+```
+
+Browsing around these sites a bit, let's use the [PECOS RIVER NEAR PUERTO DE LUNA, NM.](https://waterdata.usgs.gov/monitoring-location/08383500/) Since the reference gages include network locations on the NHDPlusV2, we can use them with the [Hydro Network Linked Data Index.](https://waterdata.usgs.gov/blog/nldi-intro/). 
+
+We can use the R package, `nhdplusTools` to interact with the NLDI. Below, we get the basin boundary, mainstem, and all sites in the Western States Water Councile Water Data Exchange upstream of this stream gage.
+
+```{r}
+site <- filter(stream_gages, name == "PECOS RIVER NEAR PUERTO DE LUNA, NM")
+
+nldi_feature <- list(featureSource = "nwissite", 
+                     featureID = paste0("USGS-", site$provider_id))
+
+basin <- nhdplusTools::get_nldi_basin(nldi_feature)
+
+mainstem <- nhdplusTools::navigate_nldi(nldi_feature, "UM", "flowlines", distance_km = 500)
+
+wade <- nhdplusTools::navigate_nldi(nldi_feature, "UM", "wade", distance_km = 500)
+
+mapview::mapview(wade) + mapview::mapview(sf::st_geometry(mainstem)) + mapview::mapview(hu08)
+```
+
+```{r}
+nm_wells_base_url <- "https://st.newmexicowaterdata.org/FROST-Server/v1.1/Locations?$resultFormat=GeoJSON&$skip="
+
+nr <- 1
+i <- 1
+skip <- 0
+out <- rep(list(list()), 100)
+
+while(nr > 0) {
+  out[i] <- list(sf::read_sf(paste0(nm_wells_base_url, skip)))
+  
+  out[i][[1]] <- out[i][[1]][, !colSums(is.na(out[i][[1]])) == nrow(out[i][[1]])]
+  
+  nr <- nrow(out[i][[1]])
+  skip <- skip + 200
+  i <- i + 1
+}
+
+nm_wells <- bind_rows(out[1:(i-1)])
+
+nm_wells <- sf::st_intersection(nm_wells, hu08)
+
+mapview::mapview(hu08) + mapview::mapview(nm_wells)
+```
